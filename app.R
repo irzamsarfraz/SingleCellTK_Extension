@@ -12,6 +12,7 @@ ui <- navbarPage("SingleCellTK", theme = "bootstrap.css", id = "mainPage",
 # ----
 
 # Main Server ---
+options(shiny.maxRequestSize = 1000 * 1024 ^ 2)
 server <- function(input, output, session) {
     callModule(module = Seurat_Server, id = "id_1", session)
 }
