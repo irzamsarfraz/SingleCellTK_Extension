@@ -3,12 +3,18 @@ library(shinyWidgets);
 library(shinyBS);
 library(SingleCellExperiment);
 library(Seurat);
-
+library(cowplot);
+library(svgPanZoom);
+library(shinyjqui);
+library(ggplotify);
+library(ggplot2);
+library(shinyjs);
 # User Interface for Seurat Workflow ---
 Seurat_UI <- function(id) {
     ns <- NS(id);
     fluidPage(
-        bsCollapse(id = "SeuratUI", open = "Data Input",
+    inlineCSS(list(".panel-danger>.panel-heading" = "background-color:#dcdcdc; color:#000000", ".panel-primary>.panel-heading" = "background-color:#f5f5f5; color:#000000; border-color:#dddddd", ".panel-primary"="border-color:#dddddd;",".panel-primary>.panel-heading+.panel-collapse>.panel-body"="border-color:#dddddd;")),
+        bsCollapse(id = ns("SeuratUI"), open = "Data Input",
             bsCollapsePanel("Data Input",
                 fluidRow(
                     column(4,
@@ -97,9 +103,17 @@ Seurat_UI <- function(id) {
                                 fluidRow(
                                     column(12,
                                         panel(heading = "PCA",
-                                            textInput(inputId = ns("pca_no_components"), label = "Select number of components to compute: ", value = "50"),
+                                            textInput(inputId = ns("pca_no_components"), label = "Select number of components to compute: ", value = "20"),
+                                            materialSwitch(inputId = ns("pca_compute_elbow"), label = "Compute ElbowPlot?", value = TRUE),
+                                            materialSwitch(inputId = ns("pca_compute_jackstraw"), label = "Compute JackStrawPlot?", value = TRUE),
+                                            materialSwitch(inputId = ns("pca_compute_heatmap"), label = "Compute Heatmap?", value = TRUE),
                                             actionButton(inputId = ns("run_pca_button"), "Run PCA")
-                                             )
+                                             ),
+                                        panel(heading = "Select No. of Components",
+                                            h5("Number of components suggested by ElbowPlot: "),
+                                            verbatimTextOutput(outputId = ns("pca_significant_pc_output"), placeholder = TRUE),
+                                            sliderInput(inputId = ns("pca_significant_pc_slider"), label = "Select number of components for downstream analysis: ", min = 1, max = 20, value = 10, round = TRUE)
+                                        )
                                           )
                                         )
                                   ),
@@ -115,6 +129,29 @@ Seurat_UI <- function(id) {
                                             tabPanel(title = "Elbow Plot",
                                                 panel(heading = "Elbow Plot",
                                                     plotOutput(outputId = ns("plot_elbow"))
+                                                     )
+                                                    ),
+                                            tabPanel(title = "JackStraw Plot",
+                                                panel(heading = "JackStraw Plot",
+                                                    plotOutput(outputId = ns("plot_jackstraw"))
+                                                     )
+                                                    ),
+                                            tabPanel(title = "Heatmap Plot",
+                                                panel(heading = "Heatmap Plot",
+                                                    panel(heading = "Plot Options",
+                                                        fluidRow(
+                                                            column(6,
+                                                                pickerInput(inputId = ns("picker_dimheatmap_components_pca"), label = "Select principal components to plot:", choices = c(), options = list(`actions-box` = TRUE, size = 10, `selected-text-format` = "count > 3"), multiple = TRUE)
+                                                            ),
+                                                            column(6,
+                                                                sliderInput(inputId = ns("slider_dimheatmap_pca"), label = "Number of columns for the plot: ", min = 1, max = 4, value = 2)
+                                                            )
+                                                        ),    
+                                                        actionButton(inputId = ns("plot_heatmap_pca_button"), "Plot")
+                                                        ),
+                                                    panel(heading = "Plot",
+                                                        jqui_resizable(plotOutput(outputId = ns("plot_heatmap")), options=list(maxWidth=700))
+                                                        )
                                                      )
                                                     )
                                                    )
@@ -132,7 +169,7 @@ Seurat_UI <- function(id) {
                                 fluidRow(
                                     column(12,
                                         panel(heading = "ICA",
-                                            textInput(inputId = ns("ica_no_components"), label = "Select number of components to compute: ", value = "50"),
+                                            textInput(inputId = ns("ica_no_components"), label = "Select number of components to compute: ", value = "20"),
                                             actionButton(inputId = ns("run_ica_button"), "Run ICA")
                                              )
                                           )
@@ -278,117 +315,184 @@ Seurat_Server <- function(input, output, session, x) {
     #server events
     observeEvent(input$sce_rds_file, {
         withProgress(message = "Uploading", max = 1, value = 1, {
-            seuratObject(SCEtoSeurat(input$sce_rds_file$datapath))
-            sceObject(RDStoSCE(input$sce_rds_file$datapath))
-            geneNamesSCE(RowNamesSCE(sceObject()))
-            geneNamesSeurat(RowNamesSeurat(seuratObject()))
+            seuratObject(.sceToSeurat(input$sce_rds_file$datapath))
+            sceObject(.rdsToSce(input$sce_rds_file$datapath))
+            geneNamesSCE(.rowNamesSCE(sceObject()))
+            geneNamesSeurat(.rowNamesSeurat(seuratObject()))
         })
+        updateCollapse(session = session, "SeuratUI", style = list("Data Input" = "danger"))
         showNotification("Upload complete")
     })
 
     output$hvg_output <- renderText({
-        GetVariableFeaturesSeurat(seuratObject(), input$hvg_no_features_view)
+        if (!is.null(sceObject())) {
+            if (!is.null(sceObject()@metadata[["seurat"]])) {
+                if (length(slot(sceObject()@metadata[["seurat"]], "assays")[["RNA"]]@var.features) > 0) {
+                    .seuratGetVariableFeatures(sceObject(), geneNamesSeurat(), input$hvg_no_features_view)
+                }
+            }
+        }
     })
 
     observeEvent(input$normalize_button, {
-        if (!is.null(input$sce_rds_file)) {
+        if (!is.null(sceObject())) {
             withProgress(message = "Normalizing", max = 1, value = 1, {
-                seuratObject(Normalization(seuratObject = UpdateSeurat(sceObject(), geneNamesSeurat()), input$normalization_method, as.numeric(input$scale_factor)))
+                sceObject(seuratNormalizeData(sce = sceObject(), geneNames = geneNamesSeurat(), input$normalization_method, as.numeric(input$scale_factor)))
             })
-            sceObject(UpdateSCE(sceObject(), geneNamesSeurat(), seuratObject(), "seuratNormalizedData", "data"))
-            sceObject(AddSeuratToMetaDataSCE(sceObject(), seuratObject()))
+            updateCollapse(session = session, "SeuratUI", style = list("Normalize Data" = "danger"))
             showNotification("Normalization Complete")
+        }
+        else {
+            showNotification("Please input dataset (rds file) before normalizing data!", type = "error")
         }
     })
 
     observeEvent(input$scale_button, {
-        if (!is.null(input$sce_rds_file)) {
+        if (!is.null(sceObject())) {
             withProgress(message = "Scaling", max = 1, value = 1, {
-                seuratObject(ScaleDataSeurat(UpdateSeurat(sceObject(), geneNamesSeurat()), input$model.use, input$do.scale, input$do.center, input$scale.max))
+                sceObject(seuratScaleData(sceObject(), geneNamesSeurat(), input$model.use, input$do.scale, input$do.center, input$scale.max))
             })
-            sceObject(UpdateSCE(sceObject(), geneNamesSeurat(), seuratObject(), "seuratScaledData", "scale.data"))
-            sceObject(AddSeuratToMetaDataSCE(sceObject(), seuratObject()))
+            updateCollapse(session = session, "SeuratUI", style = list("Scale Data" = "danger"))
             showNotification("Scale Complete")
+        }
+        else {
+            showNotification("Please input dataset (rds file) before scaling data!", type = "error")
         }
     })
 
     observeEvent(input$run_pca_button, {
-        if (!is.null(input$sce_rds_file)) {
-            withProgress(message = "Running PCA", max = 1, value = 1, {
-                seuratObject(PCASeurat(UpdateSeurat(sceObject(), geneNamesSeurat()), input$pca_no_components))
-                numberOfReductionComponents$pca <- dim(seuratObject()[["pca"]])[2]
-            })
-            sceObject(AddSeuratToMetaDataSCE(sceObject(), seuratObject()))
-            withProgress(message = "Plotting PCA", max = 1, value = 1, {
-                plotObject$PCA <- PlotReductionSeurat(UpdateSeurat(sceObject(), geneNamesSeurat()), "pca")
-            })
-            withProgress(message = "Generating Elbow Plot", max = 1, value = 1, {
-                plotObject$Elbow <- PlotElbowSeurat(UpdateSeurat(sceObject(), geneNamesSeurat()))
-            })
-            showNotification("PCA Complete")
+        if (!is.null(sceObject())) {
+            if (!is.null(sceObject()@metadata[["seurat"]])) {
+                if ((length(slot(sceObject()@metadata[["seurat"]], "assays")[["RNA"]]@scale.data) > 0) && (length(slot(sceObject()@metadata[["seurat"]], "assays")[["RNA"]]@var.features) > 0)) {
+                    withProgress(message = "Running PCA", max = 1, value = 1, {
+                        sceObject(seuratPCA(sceObject(), geneNamesSeurat(), input$pca_no_components))
+                        numberOfReductionComponents$pca <- dim(convertSCEToSeurat(sceObject(), geneNamesSeurat())[["pca"]])[2]
+                    })
+                    withProgress(message = "Plotting PCA", max = 1, value = 1, {
+                        plotObject$PCA <- seuratReductionPlot(sceObject(), geneNamesSeurat(), "pca")
+                    })
+                    if (input$pca_compute_elbow) {
+                        withProgress(message = "Generating Elbow Plot", max = 1, value = 1, {
+                            numberOfReductionComponents$significantPC <- .computeSignificantPC(sceObject(), geneNamesSeurat())
+                            plotObject$Elbow <- seuratElbowPlot(sceObject(), geneNamesSeurat(), numberOfReductionComponents$significantPC)
+                        })
+                    }
+                    if (input$pca_compute_jackstraw) {
+                        withProgress(message = "Generating JackStraw Plot", max = 1, value = 1, {
+                            sceObject(seuratComputeJackStraw(sceObject(), geneNamesSeurat(), input$pca_no_components))
+                            plotObject$JackStraw <- seuratJackStrawPlot(sceObject(), geneNamesSeurat(), input$pca_no_components)
+                        })
+                    }
+                    if (input$pca_compute_heatmap) {
+                        withProgress(message = "Generating Heatmap Plot", max = 1, value = 1, {
+                            plotObject$HeatmapCompute <- seuratComputeHeatmap(sceObject(), geneNamesSeurat(), input$pca_no_components)
+                            updatePickerInput(session = session, inputId = "picker_dimheatmap_components_pca", choices = .getPCAComponentNames(numberOfReductionComponents$pca))
+                        })
+                    }
+                    addTooltip(session = session, id = ns("reduction_tsne_count"), paste("Maximum components available:", numberOfReductionComponents$pca), placement = "bottom", trigger = "hover")
+                    addTooltip(session = session, id = ns("reduction_umap_count"), paste("Maximum components available:", numberOfReductionComponents$pca), placement = "bottom", trigger = "hover")
+                    addTooltip(session = session, id = ns("reduction_clustering_count"), paste("Maximum components available:", numberOfReductionComponents$pca), placement = "bottom", trigger = "hover")
+                    updateCollapse(session = session, "SeuratUI", style = list("Dimensionality Reduction" = "danger"))
+                    showNotification("PCA Complete")
+                }
+                else {
+                    showNotification("Please scale data and find highly variable genes before computing pca!", type = "error")
+                }
+            }
         }
     })
 
     observeEvent(input$run_ica_button, {
-        if (!is.null(input$sce_rds_file)) {
-            withProgress(message = "Running ICA", max = 1, value = 1, {
-                seuratObject(ICASeurat(UpdateSeurat(sceObject(), geneNamesSeurat()), input$ica_no_components))
-                numberOfReductionComponents$ica <- dim(seuratObject()[["ica"]])[2]
-            })
-            sceObject(AddSeuratToMetaDataSCE(sceObject(), seuratObject()))
-            withProgress(message = "Plotting ICA", max = 1, value = 1, {
-                plotObject$ICA <- PlotReductionSeurat(UpdateSeurat(sceObject(), geneNamesSeurat()), "ica")
-            })
-            showNotification("ICA Complete")
+         if (!is.null(sceObject())) {
+            if (!is.null(sceObject()@metadata[["seurat"]])) {
+                if ((length(slot(sceObject()@metadata[["seurat"]], "assays")[["RNA"]]@scale.data) > 0) && (length(slot(sceObject()@metadata[["seurat"]], "assays")[["RNA"]]@var.features) > 0)) {
+                    withProgress(message = "Running ICA", max = 1, value = 1, {
+                        sceObject(seuratICA(sceObject(), geneNamesSeurat(), input$ica_no_components))
+                        numberOfReductionComponents$ica <- dim(convertSCEToSeurat(sceObject(), geneNamesSeurat())[["ica"]])[2]
+                    })
+                    withProgress(message = "Plotting ICA", max = 1, value = 1, {
+                        plotObject$ICA <- seuratReductionPlot(sceObject(), geneNamesSeurat(), "ica")
+                    })
+                    updateCollapse(session = session, "SeuratUI", style = list("Dimensionality Reduction" = "danger"))
+                    showNotification("ICA Complete")
+                }
+                else {
+                    showNotification("Please scale data and find highly variable genes before computing ica!", type = "error")
+                }
+            }
         }
     })
 
     observeEvent(input$find_hvg_button, {
-        if (!is.null(input$sce_rds_file)) {
+        if (!is.null(sceObject())) {
             withProgress(message = "Finding highly variable genes", max = 1, value = 1, {
-                seuratObject(FindHVGSeurat(seuratObject = UpdateSeurat(sceObject(), geneNamesSeurat()), input$hvg_method, as.numeric(input$hvg_no_features)))
+                sceObject(seuratFindHVG(sceObject(), geneNamesSeurat(), input$hvg_method, as.numeric(input$hvg_no_features)))
             })
-            sceObject(AddSeuratToMetaDataSCE(sceObject(), seuratObject()))
             withProgress(message = "Plotting HVG", max = 1, value = 1, {
-                plotObject$HVG <- PlotHVGSeurat(seuratObject())
+                plotObject$HVG <- seuratPlotHVG(sceObject(), geneNamesSeurat())
             })
+            updateCollapse(session = session, "SeuratUI", style = list("Highly Variable Genes" = "danger"))
             showNotification("Find HVG Complete")
+        }
+        else {
+            showNotification("Please input dataset (rds file) before computing highly variable genes!", type = "error")
         }
     })
 
     observeEvent(input$find_clusters_button, {
-        if (!is.null(input$sce_rds_file)) {
-            withProgress(message = "Finding clusters", max = 1, value = 1, {
-                seuratObject(FindClustersSeurat(seuratObject = UpdateSeurat(sceObject(), geneNamesSeurat()), reduction = input$reduction_clustering_method, dims = input$reduction_clustering_count, algorithm = input$algorithm.use, group.singletons = input$group.singletons))
-            })
-            sceObject(AddSeuratToMetaDataSCE(sceObject(), seuratObject()))
-            showNotification("Find Clusters Complete")
+        if (!is.null(sceObject())) {
+            if (!is.null(sceObject()@metadata[["seurat"]])) {
+                if (!is.null(slot(sceObject()@metadata[["seurat"]], "reductions")[[input$reduction_clustering_method]])) {
+                    withProgress(message = "Finding clusters", max = 1, value = 1, {
+                        sceObject(seuratFindClusters(sceObject(), geneNamesSeurat(), reduction = input$reduction_clustering_method, dims = input$reduction_clustering_count, algorithm = input$algorithm.use, group.singletons = input$group.singletons))
+                    })
+                    updateCollapse(session = session, "SeuratUI", style = list("Clustering" = "danger"))
+                    showNotification("Find Clusters Complete")
+                }
+                else {
+                    showNotification("Please compute pca/ica before processing clusters!", type = "error")
+                }
+            }
         }
     })
 
     observeEvent(input$run_tsne_button, {
-        if (!is.null(input$sce_rds_file)) {
-            withProgress(message = "Running tSNE", max = 1, value = 1, {
-                seuratObject(RunTSNESeurat(seuratObject = UpdateSeurat(sceObject(), geneNamesSeurat()), input$reduction_tsne_method, input$reduction_tsne_count))
-            })
-            sceObject(AddSeuratToMetaDataSCE(sceObject(), seuratObject()))
-            withProgress(message = "Plotting tSNE", max = 1, value = 1, {
-                plotObject$TSNE <- PlotReductionSeurat(UpdateSeurat(sceObject(), geneNamesSeurat()), "tsne")
-            })
-            showNotification("tSNE Complete")
+        if (!is.null(sceObject())) {
+            if (!is.null(sceObject()@metadata[["seurat"]])) {
+                if (!is.null(slot(sceObject()@metadata[["seurat"]], "reductions")[[input$reduction_tsne_method]])) {
+                    withProgress(message = "Running tSNE", max = 1, value = 1, {
+                        sceObject(seuratRunTSNE(sceObject(), geneNamesSeurat(), input$reduction_tsne_method, input$reduction_tsne_count))
+                    })
+                    withProgress(message = "Plotting tSNE", max = 1, value = 1, {
+                        plotObject$TSNE <- seuratReductionPlot(sceObject(), geneNamesSeurat(), "tsne")
+                    })
+                    updateCollapse(session = session, "SeuratUI", style = list("tSNE/UMAP" = "danger"))
+                    showNotification("tSNE Complete")
+                }
+                else {
+                    showNotification("Please compute pca/ica before processing tsne!", type = "error")
+                }
+            }
         }
     })
 
     observeEvent(input$run_umap_button, {
-        if (!is.null(input$sce_rds_file)) {
-            withProgress(message = "Running UMAP", max = 1, value = 1, {
-                seuratObject(RunUMAPSeurat(seuratObject = UpdateSeurat(sceObject(), geneNamesSeurat()), input$reduction_umap_method, input$reduction_umap_count))
-            })
-            sceObject(AddSeuratToMetaDataSCE(sceObject(), seuratObject()))
-            withProgress(message = "Plotting UMAP", max = 1, value = 1, {
-                plotObject$UMAP <- PlotReductionSeurat(UpdateSeurat(sceObject(), geneNamesSeurat()), "umap")
-            })
-            showNotification("UMAP Complete")
+        if (!is.null(sceObject())) {
+            if (!is.null(sceObject()@metadata[["seurat"]])) {
+                if (!is.null(slot(sceObject()@metadata[["seurat"]], "reductions")[[input$reduction_umap_method]])) {
+                    withProgress(message = "Running UMAP", max = 1, value = 1, {
+                        sceObject(seuratRunUMAP(sceObject(), geneNamesSeurat(), input$reduction_umap_method, input$reduction_umap_count))
+                    })
+                    withProgress(message = "Plotting UMAP", max = 1, value = 1, {
+                        plotObject$UMAP <- seuratReductionPlot(sceObject(), geneNamesSeurat(), "umap")
+                    })
+                    updateCollapse(session = session, "SeuratUI", style = list("tSNE/UMAP" = "danger"))
+                    showNotification("UMAP Complete")
+                }
+                else {
+                    showNotification("Please compute pca/ica before processing umap!", type = "error")
+                }
+            }
         }
     })
 
@@ -401,6 +505,24 @@ Seurat_Server <- function(input, output, session, x) {
     output$seurat_summary_output <- renderText({
         if (!is.null(input$sce_rds_file)) {
             capture.output(seuratObject())
+        }
+    })
+
+    output$pca_significant_pc_output <- renderText({
+        if (!is.null(numberOfReductionComponents$significantPC)) {
+            numberOfReductionComponents$significantPC
+        }
+    })
+
+    observe({
+        if (!is.null(numberOfReductionComponents$pca)) {
+            updateSliderInput(session = session, inputId = "pca_significant_pc_slider", max = numberOfReductionComponents$pca)
+        }
+    })
+
+    observe({
+        if (!is.null(numberOfReductionComponents$significantPC)) {
+            updateSliderInput(session = session, inputId = "pca_significant_pc_slider", value = numberOfReductionComponents$significantPC)
         }
     })
 
@@ -423,7 +545,7 @@ Seurat_Server <- function(input, output, session, x) {
             "seuratObject.rds"
         },
         content = function(file) {
-            saveRDS(UpdateSeurat(sceObject(), geneNamesSeurat()), file)
+            saveRDS(convertSCEToSeurat(sceObject(), geneNamesSeurat()), file)
         }
     )
 
@@ -454,6 +576,18 @@ Seurat_Server <- function(input, output, session, x) {
         }
     })
 
+    output$plot_jackstraw <- renderPlot({
+        if (!is.null(input$sce_rds_file)) {
+            plotObject$JackStraw
+        }
+    })
+
+    output$plot_heatmap <- renderPlot({
+        if (!is.null(input$sce_rds_file)) {
+            plotObject$Heatmap
+        }
+    })
+
     output$plot_ica <- renderPlot({
         if (!is.null(input$sce_rds_file)) {
             plotObject$ICA
@@ -474,176 +608,221 @@ Seurat_Server <- function(input, output, session, x) {
 
     observe({
         if (input$reduction_umap_method == "pca") {
-            updateTextInput(session = session, inputId = "reduction_umap_count", value = numberOfReductionComponents$pca)
-            }
+            updateTextInput(session = session, inputId = "reduction_umap_count", value = input$pca_significant_pc_slider)
+        }
         else if (input$reduction_umap_method == "ica") {
             updateTextInput(session = session, inputId = "reduction_umap_count", value = numberOfReductionComponents$ica)
-            }
+        }
         if (input$reduction_clustering_method == "pca") {
-            updateTextInput(session = session, inputId = "reduction_clustering_count", value = numberOfReductionComponents$pca)
-            }
+            updateTextInput(session = session, inputId = "reduction_clustering_count", value = input$pca_significant_pc_slider)
+        }
         else if (input$reduction_clustering_method == "ica") {
             updateTextInput(session = session, inputId = "reduction_clustering_count", value = numberOfReductionComponents$ica)
-            }
+        }
         if (input$reduction_tsne_method == "pca") {
-            updateTextInput(session = session, inputId = "reduction_tsne_count", value = numberOfReductionComponents$pca)
-            }
+            updateTextInput(session = session, inputId = "reduction_tsne_count", value = input$pca_significant_pc_slider)
+        }
         else if (input$reduction_tsne_method == "ica") {
             updateTextInput(session = session, inputId = "reduction_tsne_count", value = numberOfReductionComponents$ica)
-            }
+        }
     })
+ 
+   observeEvent(input$plot_heatmap_pca_button, {
+        if (!is.null(input$picker_dimheatmap_components_pca)) {
+            plotObject$Heatmap <- seuratHeatmapPlot(plotObject$HeatmapCompute, length(input$picker_dimheatmap_components_pca), input$slider_dimheatmap_pca, input$picker_dimheatmap_components_pca)
+        }
+   })
 }
 # ----
 
 # Helper/Wrapper Functions ---
 
-#' RDStoSCE
-#' Reads RDS file and loads into SingleCellExperiment object
-#' @param filePath (path of the RDS file)
-#'
-#' @return SingleCellExperiment object
-#' @export
-#'
-#' @examples
-RDStoSCE <- function(filePath) {
+#' .getPCAComponentNames
+#' Creates a list of PC components to populate the picker for PC heatmap generation
+#' @param maxComponents; number of components to return for the picker
+#' @return componentNames; list of component names (appended with "PC")
+.getPCAComponentNames <- function(maxComponents) {
+    componentNames <- list()
+    for (i in 1:maxComponents) {
+        componentNames[i] <- paste0("PC",i)
+    }
+    return(componentNames)
+}
+
+#' .rdsToSce
+#' Reads rds file (from a local path) and loads into sce object 
+#' *Only to be used for first time initialization of the rds file into R environment*
+#' @param filePath; path of the rds file to load
+#' @return sce object
+.rdsToSce <- function(filePath) {
     sce <- readRDS(filePath)
     return(sce)
 }
 
-#' SCEtoSeurat
-#' Converts a SingleCellExperiment object to Seurat object using RDS filepath
-#' @param filePath (path of the RDS file)
-#' 
-#' @return Seurat object
-#' @export
-#'
-#' @examples
-SCEtoSeurat <- function(filePath) {
-    seuratObject <- CreateSeuratObject(counts = counts(RDStoSCE(filePath)))
+#' .sceToSeurat
+#' Converts a sce object to seurat object (using rds filepath)
+#' *Only to be used for first time initialization of seurat object*
+#' @param filePath; path of the rds file to convert to seurat object
+#' @return seurat object
+.sceToSeurat <- function(filePath) {
+    seuratObject <- CreateSeuratObject(counts = counts(.rdsToSce(filePath)))
     return(seuratObject)
 }
 
-#' getFeatureNamesSeurat
-#' Extract feature names from Seurat object available in the meta.data slot
-#' @param seuratObject
-#'
-#' @return character list containing feature names
-#' @export
-#'
-#' @examples
-getFeatureNamesSeurat <- function(seuratObject) {
-    return(names(seuratObject@meta.data))
+#' .addSeuratToMetaDataSCE
+#' Adds the input seurat object to the metadata slot of the input sce object (after removing the data matrices)
+#' @param sce; sce object to which seurat object should be added in the metadata slot (copy to)
+#' @param seuratObject; seurat object which should be added to the metadata slot of sce object (copy from)
+#' @return sce; updated sce object which now contains the seurat object in its metadata slot (excluding data matrices)
+.addSeuratToMetaDataSCE <- function(sce, seuratObject) {
+    seuratObject@assays$RNA@counts <- new("dgCMatrix")
+    seuratObject@assays$RNA@data <- new("dgCMatrix")
+    seuratObject@assays$RNA@scale.data <- matrix()
+    sce@metadata[["seurat"]] <- seuratObject
+    return(sce)
 }
 
-
-#' FeatureScatterPlot
-#' Generates a scatter plot against 'two' selected attributes/features of the seurat object
-#' @param seuratObject
-#' @param features (list of features selected from seurat object, max=2)
-#'
-#' @return plot object
-#' @export
-#'
-#' @examples
-FeatureScatterPlot <- function(seuratObject, features) {
-    FeatureScatter(seuratObject, feature1 = features[1], feature2 = features[2])
+#' .rowNamesSeurat
+#' Retrieves a list of genenames/rownames/featurenames from seurat object
+#' @param seuratObject; seurat object from which the genenames/rownames/featurenames should be extracted
+#' @return list() of genenames/rownames/featurenames
+.rowNamesSeurat <- function(seuratObject) {
+    return(rownames(seuratObject))
 }
 
-#' Normalization
-#' Normalize the seurat object (data) using the provided parameters and returns an updated seurat object
-#' @param seuratObject
-#' @param normalizationMethod
-#' @param scaleFactor
-#'
-#' @return seurat object
-#' @export
-#'
-#' @examples
-Normalization <- function(seuratObject, normalizationMethod, scaleFactor) {
-    return(NormalizeData(seuratObject, normalization.method = normalizationMethod, scale.factor = scaleFactor))
+#' .rowNamesSCE
+#' Retrieves a list of genenames/rownames/featurenames from sce object
+#' @param sce; sce object from which the genenames/rownames/featurenames should be extracted
+#' @return list() of genenames/rownames/featurenames
+.rowNamesSCE <- function(sce) {
+    return(rownames(sce))
 }
 
-
-#' ScaleDataSeurat
-#' Scales the seurat object (data) using the provided parameters and returns an updated seurat object
-#' @param seuratObject
-#' @param model.use
-#' @param do.scale
-#' @param do.center
-#' @param scale.max
-#'
-#' @return seurat object
-#' @export
-#'
-#' @examples
-ScaleDataSeurat <- function(seuratObject, model.use, do.scale, do.center, scale.max) {
-    return(ScaleData(seuratObject, model.use = model.use, do.scale = do.scale, do.center = do.center, scale.max = as.double(scale.max)))
+#' .computeSignificantPC
+#' Computes the significant principal components from an input sce object (must containt pca slot) using stdev
+#' @param sceObject; sce object with pca computed
+#' @param geneNamesSeurat; a list of rowames/genenames/featurenames for seurat object for consistent formatting
+#' @return max_components; a numerical value indicating how many number of components are considered significant
+.computeSignificantPC <- function(sceObject, geneNamesSeurat) {
+    seuratObject <- convertSCEToSeurat(sceObject, geneNamesSeurat)
+    max_components <- 0
+    for (i in 1:(length(seuratObject[["pca"]]@stdev) - 1)) {
+        if (abs(seuratObject[["pca"]]@stdev[i + 1] - seuratObject[["pca"]]@stdev[i]) > 0.1) {
+            max_components <- i
+        }
+    }
+    return(max_components)
 }
 
-#' PCASeurat
-#' Computes the principal component analysis on the provided seurat object (data) and returns the updated seurat object
-#' @param seuratObject
-#' @param npcs
-#'
-#' @return seurat object
+#' seuratNormalizeData
+#' Wrapper for NormalizeData() function from seurat library
+#' Normalizes the sce object according to the input parameters 
+#' @param sceObject; sce object to normalize
+#' @param geneNamesSeurat; a list of rowames/genenames/featurenames for seurat object for consistent formatting
+#' @param normalizationMethod; selected normalization method (default is "LogNormalize")
+#' @param scaleFactor; numeric value that represents the scaling factor (default is 10000)
+#' @return sceObject; normalized sce object
 #' @export
-#'
-#' @examples
-PCASeurat <- function(seuratObject, npcs) {
-    return(RunPCA(seuratObject, npcs = as.double(npcs)))
+seuratNormalizeData <- function(sceObject, geneNamesSeurat, normalizationMethod, scaleFactor) {
+    seuratObject <- NormalizeData(convertSCEToSeurat(sceObject, geneNamesSeurat), normalization.method = normalizationMethod, scale.factor = scaleFactor)
+    sceObject <- convertSeuratToSCE(sceObject, geneNamesSeurat, seuratObject, "seuratNormalizedData", "data")
+    sceObject <- .addSeuratToMetaDataSCE(sceObject, seuratObject)
+    return(sceObject)
 }
 
-#' ICASeurat
-#' Computes the independent component analysis on the provided seurat object (data) and returns the updated seurat object
-#' @param seuratObject
-#' @param nics
-#'
-#' @return seurat object
+#' seuratScaleData
+#' Scales the input sce object according to the input parameters
+#' @param sceObject; sce object to scale
+#' @param geneNamesSeurat; a list of rowames/genenames/featurenames for seurat object for consistent formatting
+#' @param model.use; selected model to use for scaling data (default is "linear")
+#' @param do.scale; boolean if data should be scaled or not (TRUE or FALSE, default is TRUE)
+#' @param do.center; boolean if data should be centered or not (TRUE or FALSE, default is TRUE)
+#' @param scale.max; maximum numeric value to return for scaled data (default is 10)
+#' @return sceObject; scaled sce object
 #' @export
-#'
-#' @examples
-ICASeurat <- function(seuratObject, nics) {
-    return(RunICA(seuratObject, nics = as.double(nics)))
+seuratScaleData <- function(sceObject, geneNamesSeurat, model.use, do.scale, do.center, scale.max) {
+    seuratObject <- ScaleData(convertSCEToSeurat(sceObject, geneNamesSeurat), model.use = model.use, do.scale = do.scale, do.center = do.center, scale.max = as.double(scale.max))
+    sceObject <- convertSeuratToSCE(sceObject, geneNamesSeurat, seuratObject, "seuratScaledData", "scale.data")
+    sceObject <- .addSeuratToMetaDataSCE(sceObject, seuratObject)
+    return(sceObject)
 }
 
-#' FindHVGSeurat
-#' Find highly variable genes using of the selected methods
-#' @param seuratObject
-#' @param hvgMethod
-#' @param hvgNumber
-#'
-#' @return seurat object
+#' seuratPCA
+#' Computes PCA on the input sce object and stores the calculated principal components within the sce object
+#' @param sceObject; sce object on which to compute PCA
+#' @param geneNamesSeurat; a list of rowames/genenames/featurenames for seurat object for consistent formatting
+#' @param npcs; numeric value of how many components to compute (default is 20)
+#' @return sceObject; updated sce object which now contains the computed principal components
 #' @export
-#'
-#' @examples
-FindHVGSeurat <- function(seuratObject, hvgMethod, hvgNumber) {
-    return(FindVariableFeatures(seuratObject, selection.method = hvgMethod, nfeatures = hvgNumber))
+seuratPCA <- function(sceObject, geneNamesSeurat, npcs) {
+    seuratObject <- RunPCA(convertSCEToSeurat(sceObject, geneNamesSeurat), npcs = as.double(npcs))
+    sceObject <- .addSeuratToMetaDataSCE(sceObject, seuratObject)
+    return(sceObject)
 }
 
-
-#' PlotHVGSeurat
-#' Plot the highly variable genes
-#' @param seuratObject
-#'
-#' @return plot object
+#' seuratICA
+#' Computes ICA on the input sce object and stores the calculated independent components within the sce object
+#' @param sceObject; sce object on which to compute ICA
+#' @param geneNamesSeurat; a list of rowames/genenames/featurenames for seurat object for consistent formatting
+#' @param nics; numeric value of how many components to compute (default is 20)
+#' @return sceObject; updated sce object which now contains the computed independent components
 #' @export
-#'
-#' @examples
-PlotHVGSeurat <- function(seuratObject) {
+seuratICA <- function(sceObject, geneNamesSeurat, nics) {
+    seuratObject <- RunICA(convertSCEToSeurat(sceObject, geneNamesSeurat), nics = as.double(nics))
+    sceObject <- .addSeuratToMetaDataSCE(sceObject, seuratObject)
+    return(sceObject)
+}
+
+#' seuratComputeJackStraw
+#' Compute jackstraw plot and store the computations in the input sce object
+#' @param sceObject; sce object on which to compute and store jackstraw plot
+#' @param geneNamesSeurat; a list of rowames/genenames/featurenames for seurat object for consistent formatting
+#' @param dims; numeric value of how many components to use for jackstraw plot (default = number of computed principal components)
+#' @return sceObject; updated sce object with jackstraw computations stored in it
+#' @export
+seuratComputeJackStraw <- function(sceObject, geneNamesSeurat, dims) {
+    seuratObject <- convertSCEToSeurat(sceObject, geneNamesSeurat)
+    seuratObject <- JackStraw(seuratObject, dims = as.double(dims))
+    seuratObject <- ScoreJackStraw(seuratObject, dims = 1:dims)
+    sceObject <- .addSeuratToMetaDataSCE(sceObject, seuratObject)
+    return(sceObject)
+}
+
+#' seuratFindHVG
+#' Find highly variable genes and store in the input sce object
+#' @param sceObject; sce object to compute highly variable genes from and to store back to it
+#' @param geneNamesSeurat; a list of rowames/genenames/featurenames for seurat object for consistent formatting
+#' @param hvgMethod; selected method to use for computation of highly variable genes (default is "vst")
+#' @param hvgNumber; numeric value of how many genes to select as highly variable (default is 2000)
+#' @return sceObject; updated sce object with highly variable genes computation stored
+#' @export
+seuratFindHVG <- function(sceObject, geneNamesSeurat, hvgMethod, hvgNumber) {
+    seuratObject <- convertSCEToSeurat(sceObject, geneNamesSeurat)
+    seuratObject <- FindVariableFeatures(seuratObject, selection.method = hvgMethod, nfeatures = hvgNumber)
+    sceObject <- .addSeuratToMetaDataSCE(sceObject, seuratObject)
+    return(sceObject)
+}
+
+#' seuratPlotHVG
+#' Plot highly variable genes from input sce object (must have highly variable genes computations stored)
+#' @param sceObject; sce object that contains the highly variable genes computations
+#' @param geneNamesSeurat; a list of rowames/genenames/featurenames for seurat object for consistent formatting
+#' @return plot object 
+#' @export
+seuratPlotHVG <- function(sceObject, geneNamesSeurat) {
+    seuratObject <- convertSCEToSeurat(sceObject, geneNamesSeurat)
     return(VariableFeaturePlot(seuratObject))
 }
 
-#' PlotReductionSeurat
-#' Plots the dimensionality reduction algorithms i.e. pca, ica, tsne and umap from the input seurat object
-#' @param seuratObject
-#' @param reduction
-#'
+#' seuratReductionPlot
+#' Plots the selected dimensionality reduction method
+#' @param sceObject; sce object which has the selected dimensionality reduction algorithm already computed and stored
+#' @param geneNamesSeurat; a list of rowames/genenames/featurenames for seurat object for consistent formatting
+#' @param reduction; one of selected algorithm from pca, ica, tsne and umap
 #' @return plot object
 #' @export
-#'
-#' @examples
-PlotReductionSeurat <- function(seuratObject, reduction) {
-
+seuratReductionPlot <- function(sceObject, geneNamesSeurat, reduction) {
+    seuratObject <- convertSCEToSeurat(sceObject, geneNamesSeurat)
     plot <- DimPlot(seuratObject, reduction = reduction)
     if ("ident" %in% names(plot$data) && "seurat_clusters" %in% names(seuratObject@meta.data)) {
         plot$data$ident <- seuratObject@meta.data$seurat_clusters
@@ -652,35 +831,29 @@ PlotReductionSeurat <- function(seuratObject, reduction) {
 }
 
 
-#' UpdateSCE
+#' convertSeuratToSCE
 #' Modifies the input sce object to include the updated assays from seurat object
-#' @param sce
-#' @param geneNames
-#' @param seuratObject
-#' @param assaySlotSCE
-#' @param assaySlotSeurat
-#'
-#' @return singlecellexperiment object
+#' @param sce; outdated sce object in which we wish to include the newly calculated assays from seurat object
+#' @param geneNames; a list of rowames/genenames/featurenames for seurat object for consistent formatting
+#' @param seuratObject; updated seurat object that contains the newly calculated assays that we wish to store in the sce object
+#' @param assaySlotSCE; the relevant assay slot in sce object (copy to)
+#' @param assaySlotSeurat; the relevant assay slow in seurat object (copy from)
+#' @return sce; sce object that contains the newly added/modified assays from the seurat object
 #' @export
-#'
-#' @examples
-UpdateSCE <- function(sce, geneNames, seuratObject, assaySlotSCE, assaySlotSeurat) {
+convertSeuratToSCE <- function(sce, geneNames, seuratObject, assaySlotSCE, assaySlotSeurat) {
     assay(sce, assaySlotSCE) <- NULL
     assay(sce, assaySlotSCE) <- slot(seuratObject@assays$RNA, assaySlotSeurat)
     rownames(sce) <- geneNames
     return(sce)
 }
 
-#' UpdateSeurat
-#' Modifies the seurat object to include updated assays from input sce object
-#' @param sce
-#' @param geneNames
-#'
-#' @return seurat object
+#' convertSCEToSeurat
+#' Converts sce object to seurat while retaining all assays and metadata
+#' @param sce; sce object to convert to seurat
+#' @param geneNames; a list of rowames/genenames/featurenames for seurat object for consistent formatting
+#' @return seuratObject; updated seurat object that contains all data from the input sce object
 #' @export
-#'
-#' @examples
-UpdateSeurat <- function(sce, geneNames) {
+convertSCEToSeurat <- function(sce, geneNames) {
     seuratObject <- CreateSeuratObject(counts = counts(sce))
     if ("seuratNormalizedData" %in% names(assays(sce))) {
         seuratObject@assays$RNA@data <- assay(sce, "seuratNormalizedData")
@@ -696,6 +869,9 @@ UpdateSeurat <- function(sce, geneNames) {
     if (!is.null(sce@metadata[["seurat"]]) && !is.null(sce@metadata[["seurat"]]@reductions$pca)) {
         seuratObject@reductions$pca <- sce@metadata[["seurat"]]@reductions$pca
     }
+    if (!is.null(sce@metadata[["seurat"]]) && !is.null(sce@metadata[["seurat"]]@assays$RNA@meta.features)) {
+        seuratObject@assays$RNA@meta.features <- sce@metadata[["seurat"]]@assays$RNA@meta.features
+    }
     if (!is.null(sce@metadata[["seurat"]]) && !is.null(sce@metadata[["seurat"]]@reductions$ica)) {
         seuratObject@reductions$ica <- sce@metadata[["seurat"]]@reductions$ica
     }
@@ -708,67 +884,25 @@ UpdateSeurat <- function(sce, geneNames) {
     if (!is.null(sce@metadata[["seurat"]]) && !is.null(sce@metadata[["seurat"]]@meta.data)) {
         seuratObject@meta.data <- sce@metadata[["seurat"]]@meta.data
     }
+    if (!is.null(sce@metadata[["seurat"]]) && !is.null(sce@metadata[["seurat"]]@commands)) {
+        seuratObject@commands <- sce@metadata[["seurat"]]@commands
+    }
     return(seuratObject)
 }
 
-#' AddSeuratToMetaDataSCE
-#' Adds seurat object to the metadata slot of singlecellexperiment object after removing the data matrices so information in the seurat object is not lost
-#' @param sce
-#' @param seuratObject
-#'
-#' @return singlecellexperiment object
+#' seuratFindClusters
+#' Computes the clusters from the input sce object and stores them back in sce object
+#' @param sceObject; sce object from which clusters should be computed and stored in
+#' @param reduction; selected reduction method to use for computing clusters ("pca" or "ica", default is "pca")
+#' @param dims; numeric value of how many components to use for computing clusters (default is 10)
+#' @param algorithm; selected algorithm to compute clusters (default is "original Louvain algorithm")
+#' @param group.singletons; boolean if singletons should be grouped together or not (TRUE or FALSE, default is TRUE)
+#' @return sceObject; updated sce object which now contains the computed clusters
 #' @export
-#'
-#' @examples
-AddSeuratToMetaDataSCE <- function(sce, seuratObject) {
-    seuratObject@assays$RNA@counts <- new("dgCMatrix")
-    seuratObject@assays$RNA@data <- new("dgCMatrix")
-    seuratObject@assays$RNA@scale.data <- matrix()
-    sce@metadata[["seurat"]] <- seuratObject
-    return(sce)
-}
-
-#' RowNamesSeurat
-#' Retrieves a list of genenames/rownames/featurenames from seurat object
-#' @param seuratObject
-#'
-#' @return list of rownames
-#' @export
-#'
-#' @examples
-RowNamesSeurat <- function(seuratObject) {
-    return(rownames(seuratObject))
-}
-
-#' RowNamesSCE
-#' Retrieves a list of genenames/rownames/featurenames from singlecellexperiment object
-#' @param sce
-#'
-#' @return
-#' @export
-#'
-#' @examples
-RowNamesSCE <- function(sce) {
-    return(rownames(sce))
-}
-
-
-#' FindClustersSeurat
-#' Computes the clusters from the given seurat object
-#' @param seuratObject
-#' @param reduction
-#' @param dims
-#' @param algorithm
-#' @param group.singletons
-#'
-#' @return seurat object
-#' @export
-#'
-#' @examples
-FindClustersSeurat <- function(seuratObject, reduction, dims, algorithm, group.singletons) {
+seuratFindClusters <- function(sceObject, geneNamesSeurat, reduction, dims, algorithm, group.singletons) {
+    seuratObject <- convertSCEToSeurat(sceObject, geneNamesSeurat)
     seuratObject <- FindNeighbors(seuratObject, reduction = reduction, dims = 1:dims)
     no_algorithm <- 1
-    print(algorithm)
     if (algorithm == "original Louvain algorithm") {
         no_algorithm = 1
     } else if (algorithm == "Louvain algorithm with multilevel refinement") {
@@ -776,66 +910,110 @@ FindClustersSeurat <- function(seuratObject, reduction, dims, algorithm, group.s
     } else if (algorithm == "SLM algorithm") {
         no_algorithm = 3
     }
-    return(FindClusters(seuratObject, algorithm = no_algorithm, group.singletons = group.singletons))
+    seuratObject <- FindClusters(seuratObject, algorithm = no_algorithm, group.singletons = group.singletons)
+    sceObject <- .addSeuratToMetaDataSCE(sceObject, seuratObject)
+    return(sceObject)
 }
 
-#' RunTSNESeurat
-#' Computes tSNE from the given seurat object
-#' @param seuratObject
-#' @param reduction
-#' @param dims
-#'
-#' @return seurat object
+#' seuratRunTSNE
+#' Computes tSNE from the given sce object and stores the tSNE computations back into the sce object
+#' @param sceObject; sce object on which to compute the tSNE
+#' @param geneNamesSeurat; a list of rowames/genenames/featurenames for seurat object for consistent formatting
+#' @param reduction; selected reduction algorithm to use for computing tSNE ("pca" or "ica", default is "pca")
+#' @param dims; numerical value of how many reduction components to use for tSNE computation (default is 10)
+#' @return sceObject; updated sce object with tSNE computations stored
 #' @export
-#'
-#' @examples
-RunTSNESeurat <- function(seuratObject, reduction, dims) {
-    print(seuratObject@reductions)
-    seurat <- RunTSNE(seuratObject, reduction = reduction, dims = 1:dims)
-    return(seurat)
+seuratRunTSNE <- function(sceObject, geneNamesSeurat, reduction, dims) {
+    seuratObject <- convertSCEToSeurat(sceObject, geneNamesSeurat)
+    seuratObject <- RunTSNE(seuratObject, reduction = reduction, dims = 1:dims)
+    sceObject <- .addSeuratToMetaDataSCE(sceObject, seuratObject)
+    return(sceObject)
 }
 
-#' RunUMAPSeurat
-#' Computes UMAP from the given seurat object
-#' @param seuratObject
-#' @param reduction
-#' @param dims
-#'
-#' @return seurat object
+#' seuratRunUMAP
+#' Computes UMAP from the given sce object and stores the UMAP computations back into the sce object
+#' @param sceObject; sce object on which to compute the UMAP
+#' @param geneNamesSeurat; a list of rowames/genenames/featurenames for seurat object for consistent formatting
+#' @param reduction; selected reduction algorithm to use for computing UMAP ("pca" or "ica", default is "pca")
+#' @param dims; numerical value of how many reduction components to use for UMAP computation (default is 10)
+#' @return sceObject; updated sce object with UMAP computations stored
 #' @export
-#'
-#' @examples
-RunUMAPSeurat <- function(seuratObject, reduction, dims) {
-    print(seuratObject@reductions)
-    seurat <- RunUMAP(seuratObject, reduction = reduction, dims = 1:dims)
-    return(seurat)
+seuratRunUMAP <- function(sceObject, geneNamesSeurat, reduction, dims) {
+    seuratObject <- convertSCEToSeurat(sceObject, geneNamesSeurat)
+    seuratObject <- RunUMAP(seuratObject, reduction = reduction, dims = 1:dims)
+    sceObject <- .addSeuratToMetaDataSCE(sceObject, seuratObject)
+    return(sceObject)
 }
 
-#' GetVariableFeaturesSeurat
-#' Retrieves the requested number of variable features (feature names)
-#' @param seuratObject
-#' @param numberOfFeatures
-#'
-#' @return
-#' @export
-#'
-#' @examples
-GetVariableFeaturesSeurat <- function(seuratObject, numberOfFeatures) {
+#' .seuratGetVariableFeatures
+#' Retrieves the requested number of variable feature names
+#' @param sceObject; sce object from which to extract the variable feature names
+#' @param geneNamesSeurat; a list of rowames/genenames/featurenames for seurat object for consistent formatting
+#' @param numberOfFeatures; numerical value indicating how many feature names should be retrieved (default is 100)
+#' @return list() of variable feature names
+.seuratGetVariableFeatures <- function(sceObject, geneNamesSeurat, numberOfFeatures) {
+    seuratObject <- convertSCEToSeurat(sceObject, geneNamesSeurat)
     if (length(seuratObject@assays$RNA@var.features) > 0) {
         return(print(seuratObject@assays$RNA@var.features[1:numberOfFeatures]))
     }
 }
 
-#' PlotElbowSeurat
-#' Computes the plot object for elbow plot from the pca slot in the provided seurat object
-#' @param seuratObject
-#'
+#' seuratElbowPlot
+#' Computes the plot object for elbow plot from the pca slot in the input sce object
+#' @param sceObject; sce object from which to compute the elbow plot (pca should be computed)
+#' @param geneNamesSeurat; a list of rowames/genenames/featurenames for seurat object for consistent formatting
+#' @param significantPC; a numerical value indicating the number of significant principal components (used to alter the color of the significant components)
 #' @return plot object
 #' @export
-#'
-#' @examples
-PlotElbowSeurat <- function(seuratObject) {
-    return(ElbowPlot(seuratObject))
+seuratElbowPlot <- function(sceObject, geneNamesSeurat, significantPC) {
+    seuratObject <- convertSCEToSeurat(sceObject, geneNamesSeurat)
+    plot <- ElbowPlot(seuratObject)
+    plot <- ggplot_build(plot)
+    for (i in 1:significantPC) {
+        plot$data[[1]]$shape[i] <- 16
+        plot$data[[1]]$colour[i] <- "red"
+        plot$data[[1]]$size[i] <- 3.5
+    }
+    plot <- ggplot_gtable(plot)
+    plot <- as.ggplot(plot)
+    return(plot)
+}
+
+#' seuratJackStrawPlot
+#' Computes the plot object for jackstraw plot from the pca slot in the input sce object
+#' @param sceObject; sce object from which to compute the jackstraw plot (pca should be computed)
+#' @param geneNamesSeurat; a list of rowames/genenames/featurenames for seurat object for consistent formatting
+#' @param dims; a numerical value indicating how many components to use in the computation of jackstraw plot from pca (default is number of pca components computed)
+#' @return plot object
+#' @export
+seuratJackStrawPlot <- function(sceObject, geneNamesSeurat, dims) {
+    seuratObject <- convertSCEToSeurat(sceObject, geneNamesSeurat)
+    return(JackStrawPlot(seuratObject, dims = 1:dims))
+}
+
+#' seuratComputeHeatmap
+#' Computes the heatmap plot object from the pca slot in the input sce object
+#' @param sceObject; sce object from which to compute heatmap (pca should be computed)
+#' @param geneNamesSeurat; a list of rowames/genenames/featurenames for seurat object for consistent formatting
+#' @param dims; numerical value indicating how many components to use for the computation of heatmap plot object (default is number of pca components computed) 
+#' @return plot object
+#' @export
+seuratComputeHeatmap <- function(sceObject, geneNamesSeurat, dims) {
+    seuratObject <- convertSCEToSeurat(sceObject, geneNamesSeurat)
+    return(DimHeatmap(seuratObject, dims = 1:dims, fast = FALSE, combine = FALSE))
+}
+
+#' seuratHeatmapPlot
+#' Modifies the heatmap plot object so it contains specified number of heatmaps in a single plot 
+#' @param plotObject; plot object computed from seuratComputeHeatmap() function
+#' @param dims; numerical value of how many heatmaps to draw (default is 0)
+#' @param ncol; numerical value indicating that in how many columns should the heatmaps be distrbuted (default is 2)
+#' @param labels; list() of labels to draw on heatmaps
+#' @return modified plot object
+#' @export
+seuratHeatmapPlot <- function(plotObject, dims, ncol, labels) {
+    componentsToPlot <- as.integer(gsub("[^0-9.]", "", labels))
+    return(plot_grid(plotlist = plotObject[c(componentsToPlot)], ncol = ncol, labels = labels))
 }
 
 # ----
